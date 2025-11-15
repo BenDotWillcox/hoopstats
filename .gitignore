@@ -1,0 +1,27 @@
+# Python / build
+__pycache__/
+*.py[cod]
+*.egg-info/
+.dist/
+build/
+dist/
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Data & models (don’t push raw games to GitHub)
+data/raw/
+data/processed/
+data/outputs/
+models/
+
+# IDE/editor
+.vscode/
+.idea/
+*.swp
+
+# OS files
+.DS_Store
+Thumbs.db
