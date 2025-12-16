@@ -1,49 +1,86 @@
 from pathlib import Path
-from typing import Iterator, Tuple, Any
+from typing import Iterator, Tuple, Optional, Generator
+from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 
-def open_video(path: Path) -> cv2.VideoCapture:
-    cap = cv2.VideoCapture(str(path))
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {path}")
-    return cap
+@dataclass
+class VideoInfo:
+    width: int
+    height: int
+    fps: float
+    total_frames: int
+    duration_seconds: float
 
 
-def segment_video(cap: cv2.VideoCapture) -> list[dict]:
+class VideoLoader:
     """
-    Return a list of segments.
-    For now you can do fixed segments, e.g. every N seconds:
-      [{ "start_frame": 0, "end_frame": 5000, "camera_id": 0 }, ...]
-    Replace with real scene-cut / quarter detection later.
+    Handles loading and iterating through video frames.
     """
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    frames_per_segment = int(10 * fps)  # 10-second chunks to start
+    def __init__(self, path: str | Path):
+        self.path = Path(path)
+        if not self.path.exists():
+            raise FileNotFoundError(f"Video file not found: {self.path}")
+        
+        self._cap: Optional[cv2.VideoCapture] = None
+        self._info: Optional[VideoInfo] = None
 
-    segments = []
-    start = 0
-    while start < frame_count:
-        end = min(start + frames_per_segment, frame_count)
-        segments.append(
-            {"start_frame": start, "end_frame": end, "camera_id": 0}
+    def _ensure_open(self):
+        if self._cap is None or not self._cap.isOpened():
+            self._cap = cv2.VideoCapture(str(self.path))
+            if not self._cap.isOpened():
+                raise RuntimeError(f"Could not open video: {self.path}")
+
+    def get_info(self) -> VideoInfo:
+        """
+        Retrieve video metadata.
+        """
+        self._ensure_open()
+        width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        duration = total_frames / fps if fps > 0 else 0.0
+        
+        self._info = VideoInfo(
+            width=width,
+            height=height,
+            fps=fps,
+            total_frames=total_frames,
+            duration_seconds=duration
         )
-        start = end
+        return self._info
 
-    return segments
+    def __iter__(self) -> Generator[Tuple[int, np.ndarray], None, None]:
+        """
+        Yields (frame_index, frame_array) for the entire video.
+        """
+        self._ensure_open()
+        # Always reset to beginning for a fresh iteration
+        self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        
+        frame_idx = 0
+        while True:
+            ret, frame = self._cap.read()
+            if not ret:
+                break
+            yield frame_idx, frame
+            frame_idx += 1
 
+    def close(self):
+        """
+        Release video resources.
+        """
+        if self._cap:
+            self._cap.release()
+            self._cap = None
 
-def iter_segment_frames(cap: cv2.VideoCapture, segment: dict) -> Iterator[Tuple[int, np.ndarray]]:
-    start = segment["start_frame"]
-    end = segment["end_frame"]
+    def __enter__(self):
+        self._ensure_open()
+        return self
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, start)
-    frame_idx = start
-    while frame_idx < end:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        yield frame_idx, frame
-        frame_idx += 1
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()

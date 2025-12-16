@@ -10,6 +10,9 @@ dependencies = [
     "numpy",
     "torch",
     "torchvision",
+    "python-dotenv",
+    "inference>=0.62.2",
+    "sports",
 ]
 
 [project.scripts]
@@ -21,3 +24,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hoopstats"]
+
+[tool.hatch.dependencies]
+python-dotenv = "*"
+
+[tool.uv.sources]
+sports = { git = "https://github.com/roboflow/sports.git", rev = "feat/basketball" }
