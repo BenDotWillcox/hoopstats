@@ -8,6 +8,10 @@ load_dotenv()
 # Roboflow Configuration
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY")
 
+# SAM2 Configuration (optional - only needed for track-video command)
+SAM2_CHECKPOINT = os.getenv("SAM2_CHECKPOINT")
+SAM2_CONFIG = os.getenv("SAM2_CONFIG")
+
 def validate_config():
     """
     Validates that essential configuration variables are present.

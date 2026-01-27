@@ -4,6 +4,7 @@ import supervision as sv
 from inference import get_model
 from sports.common.view import ViewTransformer
 from sports.basketball import CourtConfiguration, League
+from sports.common.core import MeasurementUnit
 
 from .config import ROBOFLOW_API_KEY
 from .detection import Detection
@@ -41,7 +42,7 @@ def build_homographies(video_path: str, frames_dict: Dict[int, np.ndarray]) -> D
     load_keypoint_model()
 
     transformers = {}
-    config = CourtConfiguration(league=League.NBA)
+    config = CourtConfiguration(league=League.NBA, measurement_unit=MeasurementUnit.FEET)
 
     print("Computing homographies...")
     for frame_idx, frame in frames_dict.items():

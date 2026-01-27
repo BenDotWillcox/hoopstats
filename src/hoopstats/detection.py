@@ -22,6 +22,24 @@ PLAYER_DETECTION_MODEL_ID = "basketball-player-detection-3-ycjdo/4"
 PLAYER_DETECTION_MODEL_CONFIDENCE = 0.4
 PLAYER_DETECTION_MODEL_IOU_THRESHOLD = 0.9
 
+# Class ID to name mapping (10 classes from the basketball detection model)
+CLASS_NAMES = {
+    0: "ball",
+    1: "ball-in-basket",
+    2: "number",
+    3: "player",
+    4: "player-in-possession",
+    5: "player-jump-shot",
+    6: "player-layup-dunk",
+    7: "player-shot-block",
+    8: "referee",
+    9: "rim"
+}
+
+# Player-related class IDs (for filtering)
+PLAYER_CLASS_IDS = {3, 4, 5, 6, 7}
+NUMBER_CLASS_ID = 2
+
 # Global model instance
 _model = None
 

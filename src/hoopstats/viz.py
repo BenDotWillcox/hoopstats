@@ -6,6 +6,7 @@ import supervision as sv
 from typing import List, Union, Dict, Optional
 from pathlib import Path
 from sports.basketball import CourtConfiguration, League
+from sports.common.core import MeasurementUnit
 from sports.common.view import ViewTransformer
 from sports.basketball import draw_court, draw_points_on_court
 
@@ -131,7 +132,7 @@ COURT_SCALE = 0.5
 def _get_court_config():
     global _COURT_CONFIG
     if _COURT_CONFIG is None:
-        _COURT_CONFIG = CourtConfiguration(league=League.NBA)
+        _COURT_CONFIG = CourtConfiguration(league=League.NBA, measurement_unit=MeasurementUnit.FEET)
     return _COURT_CONFIG
 
 
