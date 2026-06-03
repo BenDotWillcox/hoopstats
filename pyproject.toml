@@ -1,9 +1,11 @@
 [project]
 name = "basketball-box-score-ai"
 version = "0.1.0"
-description = "Add your description here"
+description = "Basketball broadcast computer vision pipeline for detection, court mapping, trajectory export, and play analysis."
 readme = "README.md"
 requires-python = ">=3.11"
+license = { file = "LICENSE" }
+keywords = ["basketball", "computer-vision", "tracking", "sports-analytics", "roboflow"]
 dependencies = [
     "requests>=2.32.5",
     "opencv-python",
@@ -27,9 +29,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hoopstats"]
-
-[tool.hatch.dependencies]
-python-dotenv = "*"
 
 [tool.uv.sources]
 sports = { git = "https://github.com/roboflow/sports.git", rev = "feat/basketball" }

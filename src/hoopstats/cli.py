@@ -2047,3 +2047,7 @@ def main() -> None:
             render_video=getattr(args, 'render_video', False),
             fps=getattr(args, 'fps', 30.0)
         )
+
+
+if __name__ == "__main__":
+    main()
