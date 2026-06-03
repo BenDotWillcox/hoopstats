@@ -20,6 +20,17 @@ from .homography import (
 from .viz import annotate_frame, save_debug_frame, render_video
 from .numbers import NumberRecognizer, NumberValidator, extract_number_detections
 from .sam2_tracking import load_sam2_predictor, SAM2Tracker
+from .possessions import (
+    load_trajectories, segment_possessions, normalize_all_possessions,
+    save_possessions, load_possessions
+)
+from .clustering import (
+    compute_distance_matrix, cluster_possessions, get_cluster_summary
+)
+from .play_viz import (
+    draw_possession_paths, draw_cluster_summary, save_cluster_visualizations,
+    render_possession_video, get_video_clip_info
+)
 
 
 def test_video(video_path: str) -> None:
@@ -1268,6 +1279,267 @@ def test_numbers(video_path: str, out_dir: str, frames: int = 5) -> None:
         sys.exit(1)
 
 
+def segment_possessions_cmd(
+    trajectories_path: str,
+    out_dir: str,
+    segments_csv: str = None,
+    auto_detect: bool = False,
+    fastbreak_threshold: float = 4.0
+) -> None:
+    """
+    Segment trajectory data into possessions.
+    
+    Args:
+        trajectories_path: Path to trajectories JSON from Colab
+        segments_csv: Path to manual segments CSV (optional)
+        auto_detect: Auto-detect possessions from ball movement
+        fastbreak_threshold: Seconds threshold for fastbreak classification
+    """
+    print(f"Segmenting possessions from: {trajectories_path}")
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Load trajectories
+        trajectories = load_trajectories(Path(trajectories_path))
+        print(f"  Game: {trajectories.game_id}")
+        print(f"  Players: {len(trajectories.players)}")
+        print(f"  Frames: {trajectories.total_frames}")
+
+        # Segment possessions
+        manual_path = Path(segments_csv) if segments_csv else None
+        possessions = segment_possessions(
+            trajectories,
+            manual_segments=manual_path,
+            auto_detect=auto_detect,
+            fastbreak_threshold_seconds=fastbreak_threshold
+        )
+
+        print(f"\nSegmented {len(possessions)} possessions:")
+        halfcourt = sum(1 for p in possessions if p.possession_type == 'halfcourt')
+        fastbreak = sum(1 for p in possessions if p.possession_type == 'fastbreak')
+        print(f"  Half-court: {halfcourt}")
+        print(f"  Fast breaks: {fastbreak}")
+
+        # Save possessions
+        output_file = out_path / f"{trajectories.game_id}_possessions.json"
+        save_possessions(possessions, output_file)
+        print(f"\nSaved possessions to: {output_file}")
+
+    except Exception as e:
+        print(f"\nError during possession segmentation: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def cluster_plays_cmd(
+    possessions_path: str,
+    out_dir: str,
+    n_clusters: int = None,
+    distance_threshold: float = 50.0,
+    filter_type: str = None,
+    use_dtw: bool = True,
+    include_defense: bool = False
+) -> None:
+    """
+    Cluster possessions into plays.
+    
+    Args:
+        possessions_path: Path to possessions JSON
+        out_dir: Output directory
+        n_clusters: Fixed number of clusters (optional)
+        distance_threshold: Distance threshold for clustering
+        filter_type: Only cluster 'halfcourt' or 'fastbreak'
+        use_dtw: Use DTW distance (vs Euclidean)
+        include_defense: Include defensive trajectories in comparison
+    """
+    print(f"Clustering plays from: {possessions_path}")
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Load possessions
+        possessions = load_possessions(Path(possessions_path))
+        print(f"  Loaded {len(possessions)} possessions")
+
+        # Normalize
+        print("Normalizing trajectories...")
+        normalized = normalize_all_possessions(
+            possessions,
+            num_timesteps=100,
+            filter_type=filter_type
+        )
+        print(f"  Normalized {len(normalized)} possessions")
+
+        if len(normalized) < 2:
+            print("Error: Need at least 2 possessions to cluster")
+            sys.exit(1)
+
+        # Cluster
+        print("Computing distance matrix...")
+        distance_matrix = compute_distance_matrix(
+            normalized,
+            use_dtw=use_dtw,
+            include_offense=True,
+            include_defense=include_defense,
+            include_ball=True,
+            verbose=True
+        )
+
+        print("Clustering possessions...")
+        clusters = cluster_possessions(
+            normalized,
+            distance_matrix=distance_matrix,
+            n_clusters=n_clusters,
+            distance_threshold=distance_threshold,
+            verbose=True
+        )
+
+        # Print summary
+        print("\n" + get_cluster_summary(clusters))
+
+        # Save cluster visualizations
+        print("\nGenerating visualizations...")
+        viz_dir = out_path / "play_visualizations"
+        save_cluster_visualizations(clusters, normalized, viz_dir, top_n=10)
+
+        # Save cluster data
+        import json
+        cluster_data = []
+        for c in clusters:
+            cluster_data.append({
+                'cluster_id': c.cluster_id,
+                'size': c.size,
+                'possession_ids': c.possession_ids,
+                'avg_intra_cluster_distance': c.avg_intra_cluster_distance
+            })
+        
+        cluster_file = out_path / "clusters.json"
+        with open(cluster_file, 'w') as f:
+            json.dump(cluster_data, f, indent=2)
+        print(f"\nSaved cluster data to: {cluster_file}")
+
+    except Exception as e:
+        print(f"\nError during clustering: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def visualize_play_cmd(
+    possessions_path: str,
+    out_dir: str,
+    possession_id: int = None,
+    cluster_id: int = None,
+    clusters_path: str = None,
+    render_video: bool = False,
+    fps: float = 30.0
+) -> None:
+    """
+    Visualize a specific possession or cluster.
+    
+    Args:
+        possessions_path: Path to possessions JSON
+        out_dir: Output directory
+        possession_id: Specific possession to visualize
+        cluster_id: Cluster to visualize (requires clusters_path)
+        clusters_path: Path to clusters JSON
+        render_video: Render animated video
+        fps: Video FPS for rendering
+    """
+    import json
+    import cv2
+    
+    print(f"Visualizing play from: {possessions_path}")
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        # Load possessions
+        possessions = load_possessions(Path(possessions_path))
+        poss_lookup = {p.possession_id: p for p in possessions}
+
+        if possession_id is not None:
+            # Visualize single possession
+            if possession_id not in poss_lookup:
+                print(f"Error: Possession {possession_id} not found")
+                sys.exit(1)
+
+            poss = poss_lookup[possession_id]
+            print(f"  Possession {possession_id}: frames {poss.start_frame}-{poss.end_frame}")
+            print(f"  Type: {poss.possession_type}, Duration: {poss.duration_seconds:.1f}s")
+
+            # Draw paths
+            img = draw_possession_paths(poss)
+            out_file = out_path / f"possession_{possession_id}.png"
+            cv2.imwrite(str(out_file), img)
+            print(f"  Saved: {out_file}")
+
+            # Render video if requested
+            if render_video:
+                video_file = out_path / f"possession_{possession_id}.mp4"
+                render_possession_video(poss, video_file, fps=fps)
+
+            # Print video clip info
+            clip_info = get_video_clip_info(poss, Path("source_video.mp4"), fps)
+            print(f"\n  To extract source clip:")
+            print(f"    {clip_info['ffmpeg_command']}")
+
+        elif cluster_id is not None and clusters_path:
+            # Visualize cluster
+            with open(clusters_path, 'r') as f:
+                clusters_data = json.load(f)
+
+            cluster_info = None
+            for c in clusters_data:
+                if c['cluster_id'] == cluster_id:
+                    cluster_info = c
+                    break
+
+            if cluster_info is None:
+                print(f"Error: Cluster {cluster_id} not found")
+                sys.exit(1)
+
+            print(f"  Cluster {cluster_id}: {cluster_info['size']} possessions")
+            print(f"  Possession IDs: {cluster_info['possession_ids']}")
+
+            # Normalize for visualization
+            normalized = normalize_all_possessions(possessions)
+            norm_lookup = {p.possession_id: p for p in normalized}
+
+            # Create PlayCluster object for visualization
+            from .models import PlayCluster
+            cluster = PlayCluster(
+                cluster_id=cluster_id,
+                possession_ids=cluster_info['possession_ids'],
+                size=cluster_info['size']
+            )
+
+            # Draw cluster summary
+            img = draw_cluster_summary(cluster, normalized)
+            out_file = out_path / f"cluster_{cluster_id}.png"
+            cv2.imwrite(str(out_file), img)
+            print(f"  Saved: {out_file}")
+
+            # List all possessions in cluster
+            print(f"\n  Possessions in cluster:")
+            for pid in cluster_info['possession_ids']:
+                if pid in poss_lookup:
+                    p = poss_lookup[pid]
+                    print(f"    {pid}: frames {p.start_frame}-{p.end_frame} ({p.duration_seconds:.1f}s)")
+
+        else:
+            print("Error: Must specify either --possession-id or --cluster-id with --clusters")
+            sys.exit(1)
+
+    except Exception as e:
+        print(f"\nError during visualization: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Process a basketball game into shots + box score.")
@@ -1389,6 +1661,58 @@ def main() -> None:
     num_parser.add_argument("--frames", type=int, default=5,
                             help="Number of frames to sample")
 
+    # ===== PLAY RECOGNITION COMMANDS =====
+
+    # 'segment-possessions' command
+    segment_parser = subparsers.add_parser(
+        "segment-possessions", help="Segment trajectory data into possessions")
+    segment_parser.add_argument("--trajectories", required=True,
+                                help="Path to trajectories JSON from Colab")
+    segment_parser.add_argument("--out", required=True,
+                                help="Output directory for possessions JSON")
+    segment_parser.add_argument("--segments-csv",
+                                help="Path to manual segments CSV (optional)")
+    segment_parser.add_argument("--auto-detect", action="store_true",
+                                help="Auto-detect possessions from ball movement")
+    segment_parser.add_argument("--fastbreak-threshold", type=float, default=4.0,
+                                help="Seconds threshold for fastbreak classification (default: 4.0)")
+
+    # 'cluster-plays' command
+    cluster_parser = subparsers.add_parser(
+        "cluster-plays", help="Cluster possessions into plays")
+    cluster_parser.add_argument("--possessions", required=True,
+                                help="Path to possessions JSON")
+    cluster_parser.add_argument("--out", required=True,
+                                help="Output directory for clusters and visualizations")
+    cluster_parser.add_argument("--n-clusters", type=int,
+                                help="Fixed number of clusters (optional)")
+    cluster_parser.add_argument("--distance-threshold", type=float, default=50.0,
+                                help="Distance threshold for clustering (default: 50.0)")
+    cluster_parser.add_argument("--filter-type", choices=["halfcourt", "fastbreak"],
+                                help="Only cluster possessions of this type")
+    cluster_parser.add_argument("--no-dtw", action="store_true",
+                                help="Use Euclidean distance instead of DTW")
+    cluster_parser.add_argument("--include-defense", action="store_true",
+                                help="Include defensive trajectories in comparison")
+
+    # 'visualize-play' command
+    viz_parser = subparsers.add_parser(
+        "visualize-play", help="Visualize a possession or cluster")
+    viz_parser.add_argument("--possessions", required=True,
+                            help="Path to possessions JSON")
+    viz_parser.add_argument("--out", required=True,
+                            help="Output directory for visualizations")
+    viz_parser.add_argument("--possession-id", type=int,
+                            help="Specific possession ID to visualize")
+    viz_parser.add_argument("--cluster-id", type=int,
+                            help="Cluster ID to visualize (requires --clusters)")
+    viz_parser.add_argument("--clusters",
+                            help="Path to clusters JSON")
+    viz_parser.add_argument("--render-video", action="store_true",
+                            help="Render animated video")
+    viz_parser.add_argument("--fps", type=float, default=30.0,
+                            help="Video FPS for rendering (default: 30.0)")
+
     args = parser.parse_args()
 
     if args.command == "process-game":
@@ -1441,3 +1765,34 @@ def main() -> None:
 
     elif args.command == "test-numbers":
         test_numbers(args.video, args.out, args.frames)
+
+    elif args.command == "segment-possessions":
+        segment_possessions_cmd(
+            args.trajectories,
+            args.out,
+            segments_csv=getattr(args, 'segments_csv', None),
+            auto_detect=getattr(args, 'auto_detect', False),
+            fastbreak_threshold=getattr(args, 'fastbreak_threshold', 4.0)
+        )
+
+    elif args.command == "cluster-plays":
+        cluster_plays_cmd(
+            args.possessions,
+            args.out,
+            n_clusters=getattr(args, 'n_clusters', None),
+            distance_threshold=getattr(args, 'distance_threshold', 50.0),
+            filter_type=getattr(args, 'filter_type', None),
+            use_dtw=not getattr(args, 'no_dtw', False),
+            include_defense=getattr(args, 'include_defense', False)
+        )
+
+    elif args.command == "visualize-play":
+        visualize_play_cmd(
+            args.possessions,
+            args.out,
+            possession_id=getattr(args, 'possession_id', None),
+            cluster_id=getattr(args, 'cluster_id', None),
+            clusters_path=getattr(args, 'clusters', None),
+            render_video=getattr(args, 'render_video', False),
+            fps=getattr(args, 'fps', 30.0)
+        )
