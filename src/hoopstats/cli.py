@@ -184,6 +184,7 @@ def demo(
     skip_court_video: bool = False,
     include_detection_video: bool = False,
     debug_video: bool = True,
+    max_frames: int | None = None,
 ) -> None:
     """
     Run the reproducible portfolio demo against a single sample video.
@@ -256,6 +257,7 @@ def demo(
         ))
 
     if not skip_court_video:
+        trajectories_path = out_path / "trajectories" / "trajectories.json"
         stages.append(_run_demo_stage(
             "court-map video",
             "Track players, assign teams, and render top-down court positions over time.",
@@ -264,10 +266,13 @@ def demo(
                 str(videos_dir),
                 train_stride=train_stride,
                 debug=debug_video,
+                trajectories_path=str(trajectories_path),
+                max_frames=max_frames,
             ),
             [
                 videos_dir / "court_map_video" / f"{source.stem}-court-map{source.suffix}",
                 videos_dir / "court_map_video" / f"{source.stem}-tracking-debug{source.suffix}",
+                trajectories_path,
             ],
         ))
 
@@ -816,7 +821,9 @@ def map_court_video(
     team1_color: str = "#00FF00",
     team2_color: str = "#FF0000",
     train_stride: int = 30,
-    debug: bool = False
+    debug: bool = False,
+    trajectories_path: str | None = None,
+    max_frames: int | None = None
 ) -> None:
     """
     Map player positions to court coordinates for full video.
@@ -833,7 +840,10 @@ def map_court_video(
         team2_color: Hex color for team 2 (default: red)
         train_stride: Sample every Nth frame for team classifier training
         debug: If True, output additional video with tracking annotations
+        trajectories_path: Optional path for exported court-space trajectories JSON
+        max_frames: Optional maximum number of frames to process from the start
     """
+    import json
     import supervision as sv
     import subprocess
     import shutil
@@ -852,6 +862,7 @@ def map_court_video(
 
     source = Path(video_path)
     target = out_path / f"{source.stem}-court-map{source.suffix}"
+    trajectories_file = Path(trajectories_path) if trajectories_path else out_path / f"{source.stem}-trajectories.json"
 
     # Constants
     MAX_PLAYERS_PER_TEAM = 5
@@ -872,10 +883,10 @@ def map_court_video(
         """
         Enforce max 5 players per team by removing duplicates.
         When >5 players on a team, merge closest pair (keep higher confidence).
-        Returns filtered (court_xy, teams).
+        Returns filtered (court_xy, teams, keep_mask).
         """
         if len(court_xy) == 0:
-            return court_xy, teams
+            return court_xy, teams, np.array([], dtype=bool)
         
         keep_mask = np.ones(len(court_xy), dtype=bool)
         
@@ -898,9 +909,12 @@ def map_court_video(
                 keep_mask[remove_idx] = False
                 team_indices = np.where((teams == team_id) & keep_mask)[0]
         
-        return court_xy[keep_mask], teams[keep_mask]
+        return court_xy[keep_mask], teams[keep_mask], keep_mask
 
     try:
+        if max_frames is not None and max_frames <= 0:
+            raise ValueError("max_frames must be a positive integer")
+
         # Load models
         load_model_if_needed()
         load_keypoint_model()
@@ -917,6 +931,7 @@ def map_court_video(
         # =====================================================================
         print(f"Pass 1: Detection + tracking...")
         video_info = sv.VideoInfo.from_video_path(video_path)
+        frames_to_process = min(max_frames, video_info.total_frames) if max_frames is not None else video_info.total_frames
         
         # Collect crops for each tracker_id (for team majority voting)
         tracker_crops = defaultdict(list)  # tracker_id -> list of crops
@@ -926,7 +941,10 @@ def map_court_video(
         
         frame_generator = sv.get_video_frames_generator(source_path=video_path)
         
-        for frame_idx, frame in tqdm(enumerate(frame_generator), total=video_info.total_frames, desc="Detecting+Tracking"):
+        for frame_idx, frame in tqdm(enumerate(frame_generator), total=frames_to_process, desc="Detecting+Tracking"):
+            if frame_idx >= frames_to_process:
+                break
+
             # Run player detection
             result = detection._model.infer(
                 frame,
@@ -1013,6 +1031,7 @@ def map_court_video(
         # =====================================================================
         print(f"Pass 3: Homography + court mapping{' + debug video' if debug else ''}...")
         video_xy = []  # List of (court_xy, teams) for each frame
+        player_trajectories = defaultdict(list)  # tracker_id -> [[x_ft, y_ft, frame_idx], ...]
         debug_frames = [] if debug else None  # Store annotated frames for debug video
         
         # Set up debug annotators
@@ -1034,7 +1053,10 @@ def map_court_video(
         frame_generator = sv.get_video_frames_generator(source_path=video_path)
         skipped_frames = 0
         
-        for frame_idx, frame in tqdm(enumerate(frame_generator), total=video_info.total_frames, desc="Mapping"):
+        for frame_idx, frame in tqdm(enumerate(frame_generator), total=frames_to_process, desc="Mapping"):
+            if frame_idx >= frames_to_process:
+                break
+
             tracker_ids, xyxys, confidences = frame_tracking_data[frame_idx]
             
             # Handle debug annotation even for empty frames
@@ -1114,11 +1136,50 @@ def map_court_video(
             court_xy = frame_to_court_transformer.transform_points(points=bottom_centers)
             
             # Apply 5-per-team deduplication
-            court_xy, teams = deduplicate_teams(court_xy, teams, confidences)
+            court_xy, teams, keep_mask = deduplicate_teams(court_xy, teams, confidences)
+            kept_tracker_ids = tracker_ids[keep_mask] if len(keep_mask) else np.array([])
+
+            for tracker_id, xy in zip(kept_tracker_ids, court_xy):
+                player_trajectories[str(int(tracker_id))].append([
+                    float(xy[0]),
+                    float(xy[1]),
+                    int(frame_idx),
+                ])
             
             video_xy.append((court_xy, teams))
         
         print(f"\nProcessed {len(video_xy)} frames ({skipped_frames} skipped due to insufficient keypoints/players)")
+
+        trajectories_file.parent.mkdir(parents=True, exist_ok=True)
+        trajectories_payload = {
+            "game_id": source.stem,
+            "source_video": str(source),
+            "fps": float(video_info.fps),
+            "total_frames": int(frames_to_process),
+            "width": int(video_info.width),
+            "height": int(video_info.height),
+            "players": {
+                str(int(tracker_id)): {
+                    "team": int(tracker_team_map.get(int(tracker_id), -1)),
+                    "trajectory": points,
+                }
+                for tracker_id, points in sorted(
+                    player_trajectories.items(),
+                    key=lambda item: int(item[0]),
+                )
+            },
+            "ball": {"trajectory": []},
+            "metadata": {
+                "coordinate_system": "NBA court feet via Roboflow basketball court vertices",
+                "skipped_frames": int(skipped_frames),
+                "source_total_frames": int(video_info.total_frames),
+                "team_classifier_train_stride": int(train_stride),
+                "max_players_per_team": int(MAX_PLAYERS_PER_TEAM),
+            },
+        }
+        with trajectories_file.open("w", encoding="utf-8") as f:
+            json.dump(trajectories_payload, f, indent=2)
+        print(f"Saved trajectories to {trajectories_file}")
         
         # =====================================================================
         # PASS 4: Render court-only video (and debug video if requested)
@@ -1784,6 +1845,8 @@ def main() -> None:
                              help="Also render a full annotated detection video")
     demo_parser.add_argument("--no-debug-video", action="store_true",
                              help="Do not render the tracking debug video during court-map video generation")
+    demo_parser.add_argument("--max-frames", type=int,
+                             help="Limit full-video demo stages to the first N frames")
 
     # 'process-game' command
     process_parser = subparsers.add_parser(
@@ -1864,6 +1927,10 @@ def main() -> None:
                                         help="Sample every Nth frame for team classifier training (default: 30)")
     map_court_video_parser.add_argument("--debug", action="store_true",
                                         help="Output additional video with tracking annotations for debugging")
+    map_court_video_parser.add_argument("--trajectories-out",
+                                        help="Path for exported court-space trajectories JSON")
+    map_court_video_parser.add_argument("--max-frames", type=int,
+                                        help="Limit processing to the first N frames")
 
     # 'track-video' command (SAM2 mask tracking)
     track_video_parser = subparsers.add_parser(
@@ -1964,6 +2031,7 @@ def main() -> None:
             skip_court_video=getattr(args, 'skip_court_video', False),
             include_detection_video=getattr(args, 'include_detection_video', False),
             debug_video=not getattr(args, 'no_debug_video', False),
+            max_frames=getattr(args, 'max_frames', None),
         )
 
     elif args.command == "process-game":
@@ -1999,7 +2067,9 @@ def main() -> None:
             getattr(args, 'team1_color', '#00FF00'),
             getattr(args, 'team2_color', '#FF0000'),
             getattr(args, 'train_stride', 30),
-            getattr(args, 'debug', False)
+            getattr(args, 'debug', False),
+            getattr(args, 'trajectories_out', None),
+            getattr(args, 'max_frames', None)
         )
 
     elif args.command == "track-video":
