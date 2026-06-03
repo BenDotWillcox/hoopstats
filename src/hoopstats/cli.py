@@ -1,6 +1,8 @@
 from pathlib import Path
 import argparse
 import sys
+import time
+import traceback
 import numpy as np
 
 from .pipeline import GameProcessor
@@ -55,6 +57,223 @@ def test_video(video_path: str) -> None:
     except Exception as e:
         print(f"\nError loading video: {e}")
         sys.exit(1)
+
+
+def _format_duration(seconds: float) -> str:
+    if seconds < 1:
+        return f"{seconds:.2f}s"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds // 60)
+    remainder = seconds % 60
+    return f"{minutes}m {remainder:.0f}s"
+
+
+def _run_demo_stage(name: str, description: str, action, expected_outputs: list[Path]) -> dict:
+    """
+    Run a demo stage and return report metadata.
+
+    Existing CLI helpers call sys.exit(1) on failure. Catch that here so a
+    partial demo still leaves a useful report and any successful artifacts.
+    """
+    print(f"\n=== Demo stage: {name} ===")
+    started = time.perf_counter()
+    status = "ok"
+    error = ""
+
+    try:
+        action()
+    except SystemExit as exc:
+        code = exc.code if exc.code is not None else 0
+        if code != 0:
+            status = "failed"
+            error = f"exited with code {code}"
+    except Exception as exc:
+        status = "failed"
+        error = f"{type(exc).__name__}: {exc}"
+        traceback.print_exc()
+
+    duration = time.perf_counter() - started
+    outputs = [p for p in expected_outputs if p.exists()]
+
+    if status == "ok":
+        print(f"Stage complete: {name} ({_format_duration(duration)})")
+    else:
+        print(f"Stage failed: {name} ({error})")
+
+    return {
+        "name": name,
+        "description": description,
+        "status": status,
+        "error": error,
+        "duration_s": duration,
+        "outputs": outputs,
+    }
+
+
+def _write_demo_report(
+    report_path: Path,
+    video_path: Path,
+    out_dir: Path,
+    frame_num: int,
+    metadata: dict,
+    stages: list[dict],
+) -> None:
+    lines = [
+        "# HoopStats Demo Report",
+        "",
+        "## Input",
+        "",
+        f"- Video: `{video_path}`",
+        f"- Output directory: `{out_dir}`",
+        f"- Representative frame: `{frame_num}`",
+        "",
+        "## Video Metadata",
+        "",
+    ]
+
+    if metadata:
+        lines.extend([
+            f"- Resolution: `{metadata['width']}x{metadata['height']}`",
+            f"- FPS: `{metadata['fps']:.2f}`",
+            f"- Total frames: `{metadata['total_frames']}`",
+            f"- Duration: `{metadata['duration_seconds']:.2f}s`",
+        ])
+    else:
+        lines.append("- Metadata unavailable.")
+
+    lines.extend([
+        "",
+        "## Stages",
+        "",
+        "| Stage | Status | Duration | Outputs |",
+        "| --- | --- | ---: | --- |",
+    ])
+
+    for stage in stages:
+        if stage["outputs"]:
+            output_text = "<br>".join(f"`{p.relative_to(out_dir)}`" for p in stage["outputs"])
+        elif stage["error"]:
+            output_text = stage["error"]
+        else:
+            output_text = ""
+        lines.append(
+            f"| {stage['name']} | {stage['status']} | "
+            f"{_format_duration(stage['duration_s'])} | {output_text} |"
+        )
+
+    lines.extend([
+        "",
+        "## Notes",
+        "",
+        "- This demo records the current visual pipeline artifacts only.",
+        "- Trajectory export, possession segmentation, and play clustering are planned next MVP stages.",
+        "- Shot event detection and box score generation are not part of this reproducible demo yet.",
+        "",
+    ])
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def demo(
+    video_path: str,
+    out_dir: str,
+    frame_num: int = 0,
+    train_stride: int = 30,
+    skip_court_map: bool = False,
+    skip_court_video: bool = False,
+    include_detection_video: bool = False,
+    debug_video: bool = True,
+) -> None:
+    """
+    Run the reproducible portfolio demo against a single sample video.
+    """
+    source = Path(video_path)
+    out_path = Path(out_dir)
+    frames_dir = out_path / "frames"
+    videos_dir = out_path / "videos"
+
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    videos_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Running demo on: {source}")
+    print(f"Writing outputs to: {out_path}")
+
+    metadata = {}
+    stages = []
+
+    def collect_metadata():
+        nonlocal metadata
+        with VideoLoader(source) as loader:
+            info = loader.get_info()
+            metadata = {
+                "width": info.width,
+                "height": info.height,
+                "fps": info.fps,
+                "total_frames": info.total_frames,
+                "duration_seconds": info.duration_seconds,
+            }
+            print(f"  {info.width}x{info.height}, {info.fps:.2f} FPS, {info.total_frames} frames")
+
+    stages.append(_run_demo_stage(
+        "video metadata",
+        "Read basic video dimensions, frame count, FPS, and duration.",
+        collect_metadata,
+        [],
+    ))
+
+    stages.append(_run_demo_stage(
+        "single-frame detection",
+        "Detect players, jersey numbers, ball/rim events, and refs on one frame.",
+        lambda: detect_frame(str(source), str(frames_dir), frame_num, "all"),
+        [frames_dir / "single_frame_detection" / f"detect_frame_{frame_num}.jpg"],
+    ))
+
+    stages.append(_run_demo_stage(
+        "court keypoints",
+        "Detect court landmarks used for homography.",
+        lambda: detect_keypoints(str(source), str(frames_dir), frame_num),
+        [frames_dir / "keypoint_detection" / f"keypoints_frame_{frame_num}.jpg"],
+    ))
+
+    if not skip_court_map:
+        stages.append(_run_demo_stage(
+            "single-frame court map",
+            "Project detected players from one broadcast frame onto a top-down court.",
+            lambda: map_court(str(source), str(frames_dir), frame_num, train_stride=train_stride),
+            [
+                frames_dir / "court_map" / f"teams_frame_{frame_num}.jpg",
+                frames_dir / "court_map" / f"court_frame_{frame_num}.jpg",
+            ],
+        ))
+
+    if include_detection_video:
+        stages.append(_run_demo_stage(
+            "detection video",
+            "Render object detections over the full input clip.",
+            lambda: detect_video(str(source), str(videos_dir), "all"),
+            [videos_dir / "video_detection" / f"{source.stem}-detection{source.suffix}"],
+        ))
+
+    if not skip_court_video:
+        stages.append(_run_demo_stage(
+            "court-map video",
+            "Track players, assign teams, and render top-down court positions over time.",
+            lambda: map_court_video(
+                str(source),
+                str(videos_dir),
+                train_stride=train_stride,
+                debug=debug_video,
+            ),
+            [
+                videos_dir / "court_map_video" / f"{source.stem}-court-map{source.suffix}",
+                videos_dir / "court_map_video" / f"{source.stem}-tracking-debug{source.suffix}",
+            ],
+        ))
+
+    report_path = out_path / "report.md"
+    _write_demo_report(report_path, source, out_path, frame_num, metadata, stages)
+    print(f"\nDemo report written to: {report_path}")
 
 
 def detect_frame(video_path: str, out_dir: str, frame_num: int = 0, filter_class: str = "all") -> None:
@@ -1546,6 +1765,26 @@ def main() -> None:
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    # 'demo' command
+    demo_parser = subparsers.add_parser(
+        "demo", help="Run the reproducible portfolio demo")
+    demo_parser.add_argument("--video", default="data/raw/clip.mp4",
+                             help="Path to demo video (default: data/raw/clip.mp4)")
+    demo_parser.add_argument("--out", default="data/demo",
+                             help="Output directory for demo artifacts (default: data/demo)")
+    demo_parser.add_argument("--frame", type=int, default=0,
+                             help="Representative frame number for image outputs (default: 0)")
+    demo_parser.add_argument("--train-stride", type=int, default=30,
+                             help="Sample every Nth frame for team classifier training (default: 30)")
+    demo_parser.add_argument("--skip-court-map", action="store_true",
+                             help="Skip the single-frame court projection stage")
+    demo_parser.add_argument("--skip-court-video", action="store_true",
+                             help="Skip the slower full-video court map stage")
+    demo_parser.add_argument("--include-detection-video", action="store_true",
+                             help="Also render a full annotated detection video")
+    demo_parser.add_argument("--no-debug-video", action="store_true",
+                             help="Do not render the tracking debug video during court-map video generation")
+
     # 'process-game' command
     process_parser = subparsers.add_parser(
         "process-game", help="Run full pipeline on a video")
@@ -1715,7 +1954,19 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "process-game":
+    if args.command == "demo":
+        demo(
+            args.video,
+            args.out,
+            frame_num=getattr(args, 'frame', 0),
+            train_stride=getattr(args, 'train_stride', 30),
+            skip_court_map=getattr(args, 'skip_court_map', False),
+            skip_court_video=getattr(args, 'skip_court_video', False),
+            include_detection_video=getattr(args, 'include_detection_video', False),
+            debug_video=not getattr(args, 'no_debug_video', False),
+        )
+
+    elif args.command == "process-game":
         gp = GameProcessor(Path(args.video), Path(args.out))
         gp.run()
 
