@@ -17,6 +17,8 @@ data/processed/
 data/outputs/
 data/demo*/
 data/trajectory-export-check/
+data/ball-export-check/
+data/bad/
 models/
 
 # IDE/editor

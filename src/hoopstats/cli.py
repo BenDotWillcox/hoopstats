@@ -34,6 +34,8 @@ from .play_viz import (
     render_possession_video, get_video_clip_info
 )
 
+BALL_CLASS_IDS = {0, 1}  # ball, ball-in-basket
+
 
 def test_video(video_path: str) -> None:
     """
@@ -866,6 +868,8 @@ def map_court_video(
 
     # Constants
     MAX_PLAYERS_PER_TEAM = 5
+    COURT_X_MIN, COURT_X_MAX = 0.0, 94.0
+    COURT_Y_MIN, COURT_Y_MAX = 0.0, 50.0
 
     def find_closest_pair(indices, coords):
         """Find the two closest players by court distance."""
@@ -911,6 +915,16 @@ def map_court_video(
         
         return court_xy[keep_mask], teams[keep_mask], keep_mask
 
+    def valid_court_mask(points):
+        if points is None or len(points) == 0:
+            return np.array([], dtype=bool)
+        return (
+            (points[:, 0] >= COURT_X_MIN) &
+            (points[:, 0] <= COURT_X_MAX) &
+            (points[:, 1] >= COURT_Y_MIN) &
+            (points[:, 1] <= COURT_Y_MAX)
+        )
+
     try:
         if max_frames is not None and max_frames <= 0:
             raise ValueError("max_frames must be a positive integer")
@@ -936,7 +950,7 @@ def map_court_video(
         # Collect crops for each tracker_id (for team majority voting)
         tracker_crops = defaultdict(list)  # tracker_id -> list of crops
         
-        # Store frame data: list of (tracker_ids, xyxys, confidences) per frame
+        # Store frame data: list of (tracker_ids, xyxys, confidences, ball_xyxys, ball_confidences) per frame
         frame_tracking_data = []
         
         frame_generator = sv.get_video_frames_generator(source_path=video_path)
@@ -953,27 +967,53 @@ def map_court_video(
                 class_agnostic_nms=True
             )[0]
             detections = sv.Detections.from_inference(result)
+
+            ball_xyxys = np.array([]).reshape(0, 4)
+            ball_confidences = np.array([])
+            ball_mask = np.isin(detections.class_id, list(BALL_CLASS_IDS))
+            ball_detections = detections[ball_mask]
+            if len(ball_detections) > 0:
+                ball_xyxys = ball_detections.xyxy.copy()
+                ball_confidences = (
+                    ball_detections.confidence
+                    if ball_detections.confidence is not None
+                    else np.ones(len(ball_detections))
+                ).copy()
             
             # Filter to player classes
             player_mask = np.isin(detections.class_id, list(PLAYER_CLASS_IDS))
             detections = detections[player_mask]
             
             if len(detections) == 0:
-                frame_tracking_data.append((np.array([]), np.array([]).reshape(0, 4), np.array([])))
+                frame_tracking_data.append((
+                    np.array([]),
+                    np.array([]).reshape(0, 4),
+                    np.array([]),
+                    ball_xyxys,
+                    ball_confidences,
+                ))
                 continue
             
             # Run ByteTrack to get consistent tracker IDs
             tracked = byte_tracker.update_with_detections(detections)
             
             if len(tracked) == 0:
-                frame_tracking_data.append((np.array([]), np.array([]).reshape(0, 4), np.array([])))
+                frame_tracking_data.append((
+                    np.array([]),
+                    np.array([]).reshape(0, 4),
+                    np.array([]),
+                    ball_xyxys,
+                    ball_confidences,
+                ))
                 continue
             
             # Store tracking data for this frame
             frame_tracking_data.append((
                 tracked.tracker_id.copy(),
                 tracked.xyxy.copy(),
-                tracked.confidence.copy()
+                tracked.confidence.copy(),
+                ball_xyxys,
+                ball_confidences,
             ))
             
             # Extract crops for team classification (scale boxes by 0.4)
@@ -1032,6 +1072,10 @@ def map_court_video(
         print(f"Pass 3: Homography + court mapping{' + debug video' if debug else ''}...")
         video_xy = []  # List of (court_xy, teams) for each frame
         player_trajectories = defaultdict(list)  # tracker_id -> [[x_ft, y_ft, frame_idx], ...]
+        ball_trajectory = []  # [[x_ft, y_ft, frame_idx], ...]
+        ball_detection_frames = 0
+        ball_projected_points = 0
+        ball_proxy_points = 0
         debug_frames = [] if debug else None  # Store annotated frames for debug video
         
         # Set up debug annotators
@@ -1057,7 +1101,7 @@ def map_court_video(
             if frame_idx >= frames_to_process:
                 break
 
-            tracker_ids, xyxys, confidences = frame_tracking_data[frame_idx]
+            tracker_ids, xyxys, confidences, ball_xyxys, ball_confidences = frame_tracking_data[frame_idx]
             
             # Handle debug annotation even for empty frames
             if debug:
@@ -1090,7 +1134,7 @@ def map_court_video(
                     )
                     debug_frames.append(annotated)
             
-            if len(tracker_ids) == 0:
+            if len(tracker_ids) == 0 and len(ball_xyxys) == 0:
                 video_xy.append((np.array([]), np.array([])))
                 skipped_frames += 1
                 continue
@@ -1127,24 +1171,69 @@ def map_court_video(
                 target=court_landmarks
             )
             
-            # Transform player positions (bottom center of bbox)
-            # Compute bottom center: (x1+x2)/2, y2
-            bottom_centers = np.column_stack([
-                (xyxys[:, 0] + xyxys[:, 2]) / 2,  # x center
-                xyxys[:, 3]  # y bottom
-            ])
-            court_xy = frame_to_court_transformer.transform_points(points=bottom_centers)
-            
-            # Apply 5-per-team deduplication
-            court_xy, teams, keep_mask = deduplicate_teams(court_xy, teams, confidences)
-            kept_tracker_ids = tracker_ids[keep_mask] if len(keep_mask) else np.array([])
-
-            for tracker_id, xy in zip(kept_tracker_ids, court_xy):
-                player_trajectories[str(int(tracker_id))].append([
-                    float(xy[0]),
-                    float(xy[1]),
-                    int(frame_idx),
+            court_xy = np.array([])
+            kept_player_image_centers = np.array([]).reshape(0, 2)
+            if len(tracker_ids) > 0:
+                # Transform player positions (bottom center of bbox)
+                # Compute bottom center: (x1+x2)/2, y2
+                bottom_centers = np.column_stack([
+                    (xyxys[:, 0] + xyxys[:, 2]) / 2,  # x center
+                    xyxys[:, 3]  # y bottom
                 ])
+                court_xy = frame_to_court_transformer.transform_points(points=bottom_centers)
+                
+                # Apply 5-per-team deduplication
+                court_xy, teams, keep_mask = deduplicate_teams(court_xy, teams, confidences)
+                kept_tracker_ids = tracker_ids[keep_mask] if len(keep_mask) else np.array([])
+                kept_player_xyxys = xyxys[keep_mask] if len(keep_mask) else np.array([]).reshape(0, 4)
+                if len(kept_player_xyxys) > 0:
+                    kept_player_image_centers = np.column_stack([
+                        (kept_player_xyxys[:, 0] + kept_player_xyxys[:, 2]) / 2,
+                        (kept_player_xyxys[:, 1] + kept_player_xyxys[:, 3]) / 2,
+                    ])
+
+                for tracker_id, xy in zip(kept_tracker_ids, court_xy):
+                    player_trajectories[str(int(tracker_id))].append([
+                        float(xy[0]),
+                        float(xy[1]),
+                        int(frame_idx),
+                    ])
+
+            if len(ball_xyxys) > 0:
+                ball_detection_frames += 1
+                ball_centers = np.column_stack([
+                    (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2,
+                    ball_xyxys[:, 3],
+                ])
+                ball_court_xy = frame_to_court_transformer.transform_points(points=ball_centers)
+                valid_ball_mask = valid_court_mask(ball_court_xy)
+                if np.any(valid_ball_mask):
+                    valid_indices = np.where(valid_ball_mask)[0]
+                    best_valid_idx = valid_indices[int(np.argmax(ball_confidences[valid_indices]))]
+                    ball_xy = ball_court_xy[best_valid_idx]
+                    ball_projected_points += 1
+                    ball_trajectory.append([
+                        float(ball_xy[0]),
+                        float(ball_xy[1]),
+                        int(frame_idx),
+                    ])
+                elif len(court_xy) > 0 and len(kept_player_image_centers) > 0:
+                    ball_image_centers = np.column_stack([
+                        (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2,
+                        (ball_xyxys[:, 1] + ball_xyxys[:, 3]) / 2,
+                    ])
+                    distances = np.linalg.norm(
+                        ball_image_centers[:, None, :] - kept_player_image_centers[None, :, :],
+                        axis=2,
+                    )
+                    ball_idx, player_idx = np.unravel_index(np.argmin(distances), distances.shape)
+                    ball_xy = court_xy[player_idx]
+                    ball_proxy_points += 1
+                    ball_trajectory.append([
+                        float(ball_xy[0]),
+                        float(ball_xy[1]),
+                        int(frame_idx),
+                    ])
             
             video_xy.append((court_xy, teams))
         
@@ -1168,13 +1257,18 @@ def map_court_video(
                     key=lambda item: int(item[0]),
                 )
             },
-            "ball": {"trajectory": []},
+            "ball": {"trajectory": ball_trajectory},
             "metadata": {
                 "coordinate_system": "NBA court feet via Roboflow basketball court vertices",
                 "skipped_frames": int(skipped_frames),
                 "source_total_frames": int(video_info.total_frames),
                 "team_classifier_train_stride": int(train_stride),
                 "max_players_per_team": int(MAX_PLAYERS_PER_TEAM),
+                "ball_detection_classes": sorted(BALL_CLASS_IDS),
+                "ball_detection_frames": int(ball_detection_frames),
+                "ball_projected_points": int(ball_projected_points),
+                "ball_proxy_points": int(ball_proxy_points),
+                "ball_proxy_strategy": "nearest retained player when ball projection is outside court bounds",
             },
         }
         with trajectories_file.open("w", encoding="utf-8") as f:
