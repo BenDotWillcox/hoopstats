@@ -1484,6 +1484,7 @@ def map_court_video_sam2(
     COURT_Y_MIN, COURT_Y_MAX = 0.0, 50.0
     MAX_PROMPT_PLAYERS = 10      # cap the frame-0 prompt set (avoid phantom tracks)
     MIN_MASK_AREA_PX = 200       # drop collapsed/degenerate SAM2 masks per frame
+    TEAM_VOTE_STRIDE = 15        # re-predict team every N frames, majority-vote per track
 
     def valid_court_mask(points):
         if points is None or len(points) == 0:
@@ -1556,14 +1557,11 @@ def map_court_video_sam2(
               f"(Team0={int(np.sum(teams0 == 0))}, Team1={int(np.sum(teams0 == 1))})")
         tracker = SAM2Tracker(predictor)
         tracker.prompt_first_frame(first_frame, dets)
-
-        # The team classifier (SigLIP) is only needed for the frame-0 team
-        # assignment above — free its GPU memory before the SAM2 loop, which is
-        # VRAM-hungry (memory bank grows per frame).
-        del team_classifier
-        torch.cuda.empty_cache()
+        # frame-0 teams are the initial/fallback assignment; we refine them by
+        # majority vote over the clip below (robust to a bad frame-0 crop).
 
         # 3. Propagate + homography + project per frame
+        team_votes = defaultdict(list)   # tracker_id -> [team predictions]
         player_trajectories = defaultdict(list)
         ball_trajectory = []
         video_xy = []
@@ -1595,6 +1593,20 @@ def map_court_video_sam2(
             tracker_ids = (player_dets.tracker_id if player_dets.tracker_id is not None
                            else np.array([]))
             xyxys = player_dets.xyxy if len(player_dets) else np.array([]).reshape(0, 4)
+
+            # Team voting: every N frames, re-predict each tracked player's team
+            # and accumulate votes (players are better separated mid-possession
+            # than at frame 0, so the majority is more reliable).
+            if len(tracker_ids) and frame_idx % TEAM_VOTE_STRIDE == 0:
+                vote_tids, vote_crops = [], []
+                for tid, box in zip(tracker_ids, sv.scale_boxes(xyxys, factor=0.4)):
+                    crop = sv.crop_image(frame, box)
+                    if crop.size > 0:
+                        vote_tids.append(int(tid))
+                        vote_crops.append(crop)
+                if vote_crops:
+                    for tid, pred in zip(vote_tids, team_classifier.predict(vote_crops)):
+                        team_votes[tid].append(int(pred))
 
             # Ball detection (SAM2 only tracks the prompted players)
             ball_result = detection._model.infer(
@@ -1681,6 +1693,20 @@ def map_court_video_sam2(
             video_xy.append((court_xy, teams))
 
         print(f"\nProcessed {len(video_xy)} frames ({skipped_frames} skipped)")
+
+        # Finalize team assignment by majority vote per track (overrides the
+        # frame-0 guess; falls back to it for tracks with no votes).
+        flipped = 0
+        for tid, votes in team_votes.items():
+            if votes:
+                voted = int(np.bincount(votes).argmax())
+                if tracker_team_map.get(tid) != voted:
+                    flipped += 1
+                tracker_team_map[tid] = voted
+        print(f"Team voting: {len(team_votes)} tracks voted, "
+              f"{flipped} reassigned from their frame-0 team")
+        del team_classifier
+        torch.cuda.empty_cache()
 
         # 4. Clean trajectories (clean_paths), then export + render — shared with
         #    the ByteTrack path's smoothing helpers.
