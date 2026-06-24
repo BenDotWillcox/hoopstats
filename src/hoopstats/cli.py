@@ -1464,6 +1464,7 @@ def map_court_video_sam2(
     import supervision as sv
     import subprocess
     import shutil
+    import torch
     from tqdm import tqdm
     from collections import defaultdict
     from . import detection
@@ -1547,6 +1548,12 @@ def map_court_video_sam2(
               f"(Team0={int(np.sum(teams0 == 0))}, Team1={int(np.sum(teams0 == 1))})")
         tracker = SAM2Tracker(predictor)
         tracker.prompt_first_frame(first_frame, dets)
+
+        # The team classifier (SigLIP) is only needed for the frame-0 team
+        # assignment above — free its GPU memory before the SAM2 loop, which is
+        # VRAM-hungry (memory bank grows per frame).
+        del team_classifier
+        torch.cuda.empty_cache()
 
         # 3. Propagate + homography + project per frame
         player_trajectories = defaultdict(list)
