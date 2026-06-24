@@ -1482,6 +1482,8 @@ def map_court_video_sam2(
     HOMOGRAPHY_SMOOTH_ALPHA = 0.4
     COURT_X_MIN, COURT_X_MAX = 0.0, 94.0
     COURT_Y_MIN, COURT_Y_MAX = 0.0, 50.0
+    MAX_PROMPT_PLAYERS = 10      # cap the frame-0 prompt set (avoid phantom tracks)
+    MIN_MASK_AREA_PX = 200       # drop collapsed/degenerate SAM2 masks per frame
 
     def valid_court_mask(points):
         if points is None or len(points) == 0:
@@ -1540,6 +1542,12 @@ def map_court_video_sam2(
         if len(dets) == 0:
             print("Error: no players detected in frame 0 to prompt SAM2.")
             sys.exit(1)
+        # Cap the prompt set to the most-confident players so a ref/duplicate
+        # over-detection on frame 0 doesn't seed a phantom track for the whole clip.
+        if dets.confidence is not None and len(dets) > MAX_PROMPT_PLAYERS:
+            keep = np.sort(np.argsort(dets.confidence)[::-1][:MAX_PROMPT_PLAYERS])
+            dets = dets[keep]
+            print(f"  Capped frame-0 prompt to top {MAX_PROMPT_PLAYERS} by confidence")
         dets.tracker_id = np.arange(1, len(dets) + 1)
         crops = [sv.crop_image(first_frame, b) for b in sv.scale_boxes(dets.xyxy, factor=0.4)]
         teams0 = np.array(team_classifier.predict(crops))
@@ -1569,6 +1577,8 @@ def map_court_video_sam2(
             team_colors = sv.ColorPalette.from_hex([team1_color, team2_color])
             debug_box = sv.BoxAnnotator(color=team_colors, thickness=2,
                                         color_lookup=sv.ColorLookup.INDEX)
+            debug_mask = sv.MaskAnnotator(color=team_colors, opacity=0.5,
+                                          color_lookup=sv.ColorLookup.INDEX)
 
         for frame_idx, frame in tqdm(
                 enumerate(sv.get_video_frames_generator(source_path=video_path)),
@@ -1577,6 +1587,11 @@ def map_court_video_sam2(
                 break
 
             player_dets = tracker.propagate(frame)
+            # Drop collapsed/degenerate masks: a SAM2 object that loses its target
+            # returns a tiny/empty mask, which otherwise becomes a false court dot.
+            if player_dets.mask is not None and len(player_dets):
+                areas = player_dets.mask.reshape(len(player_dets), -1).sum(axis=1)
+                player_dets = player_dets[areas >= MIN_MASK_AREA_PX]
             tracker_ids = (player_dets.tracker_id if player_dets.tracker_id is not None
                            else np.array([]))
             xyxys = player_dets.xyxy if len(player_dets) else np.array([]).reshape(0, 4)
@@ -1593,13 +1608,16 @@ def map_court_video_sam2(
                          else np.ones(len(ball_all)))
 
             if debug:
-                if len(xyxys) == 0:
+                if len(player_dets) == 0:
                     debug_frames.append(frame.copy())
                 else:
-                    ddet = sv.Detections(xyxy=xyxys, tracker_id=tracker_ids.astype(int))
                     fteams = np.array([tracker_team_map.get(int(t), 0) for t in tracker_ids])
+                    annotated = frame.copy()
+                    if player_dets.mask is not None:
+                        annotated = debug_mask.annotate(
+                            scene=annotated, detections=player_dets, custom_color_lookup=fteams)
                     annotated = debug_box.annotate(
-                        scene=frame.copy(), detections=ddet, custom_color_lookup=fteams)
+                        scene=annotated, detections=player_dets, custom_color_lookup=fteams)
                     debug_frames.append(annotated)
 
             # Homography (EMA + gap-fill), mirrors the ByteTrack path
