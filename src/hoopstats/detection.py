@@ -1,7 +1,6 @@
 from typing import List, Tuple, Optional
 from dataclasses import dataclass
 import numpy as np
-from inference import get_model
 import supervision as sv
 import cv2
 
@@ -47,6 +46,10 @@ _model = None
 def load_model_if_needed():
     global _model
     if _model is None:
+        # Imported lazily so unit tests can import this module without
+        # pulling in the full Roboflow inference stack.
+        from inference import get_model
+
         print(f"Loading Roboflow model: {PLAYER_DETECTION_MODEL_ID}...")
         try:
             _model = get_model(

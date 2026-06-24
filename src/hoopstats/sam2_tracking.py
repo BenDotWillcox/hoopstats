@@ -58,17 +58,20 @@ def load_sam2_predictor(
         )
     
     checkpoint_path = Path(checkpoint_path)
-    config_path = Path(config_path)
-    
+
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"SAM2 checkpoint not found: {checkpoint_path}")
-    if not config_path.exists():
-        raise FileNotFoundError(f"SAM2 config not found: {config_path}")
-    
+    # The config is often a Hydra config *name* resolved against SAM2's package
+    # search path (e.g. "configs/sam2.1/sam2.1_hiera_l.yaml"), not a file on
+    # disk — so warn rather than fail if it isn't a local file.
+    if not Path(config_path).exists():
+        print(f"  Note: SAM2 config '{config_path}' is not a local file; "
+              f"passing through for Hydra to resolve.")
+
     print(f"Loading SAM2 predictor...")
     print(f"  Checkpoint: {checkpoint_path}")
     print(f"  Config: {config_path}")
-    
+
     predictor = build_sam2_camera_predictor(str(config_path), str(checkpoint_path))
     print("SAM2 predictor loaded successfully.")
     

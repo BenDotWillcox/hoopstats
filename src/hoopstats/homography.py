@@ -83,12 +83,24 @@ def build_homographies(video_path: str, frames_dict: Dict[int, np.ndarray]) -> D
     return transformers
 
 
-def pick_homography_for_frame(transformers: Dict[int, ViewTransformer], frame_idx: int) -> Optional[ViewTransformer]:
+def pick_homography_for_frame(
+    transformers: Dict[int, ViewTransformer],
+    frame_idx: int,
+    max_delta: int = 30,
+) -> Optional[ViewTransformer]:
     """
-    Find the best homography for a given frame.
-    Currently simple lookup. Could use nearest neighbor if sparse.
+    Find the homography for a frame, falling back to the nearest frame with a
+    valid homography within max_delta frames (broadcast camera motion is
+    smooth enough over ~1s for shot-location purposes).
     """
-    return transformers.get(frame_idx)
+    if frame_idx in transformers:
+        return transformers[frame_idx]
+    if not transformers:
+        return None
+    nearest = min(transformers.keys(), key=lambda f: abs(f - frame_idx))
+    if abs(nearest - frame_idx) <= max_delta:
+        return transformers[nearest]
+    return None
 
 
 def add_court_coordinates(transformer: ViewTransformer, detection: Detection) -> Tuple[Optional[float], Optional[float]]:

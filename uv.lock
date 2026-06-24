@@ -370,6 +370,11 @@ dependencies = [
     { name = "torchvision" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "inference", specifier = ">=0.62.2" },
@@ -384,6 +389,9 @@ requires-dist = [
     { name = "torch" },
     { name = "torchvision" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pytest", specifier = ">=8" }]
 
 [[package]]
 name = "bce-python-sdk"

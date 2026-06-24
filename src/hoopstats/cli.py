@@ -168,9 +168,10 @@ def _write_demo_report(
         "",
         "## Notes",
         "",
-        "- This demo records the current visual pipeline artifacts only.",
-        "- Trajectory export, possession segmentation, and play clustering are planned next MVP stages.",
-        "- Shot event detection and box score generation are not part of this reproducible demo yet.",
+        "- Shot events are detected from shot-pose detections (`player-jump-shot`, `player-layup-dunk`)",
+        "  with `ball-in-basket` used for make/miss; shot locations come from court homography at the release frame.",
+        "- `stats/shots.csv` is the shot log; `stats/box_score.csv` aggregates per shooter (team#number).",
+        "- See the README section 'Shot Detection & Box Score' for model assumptions and failure modes.",
         "",
     ])
 
@@ -277,6 +278,17 @@ def demo(
                 trajectories_path,
             ],
         ))
+
+    stats_dir = out_path / "stats"
+    stages.append(_run_demo_stage(
+        "shot detection + box score",
+        "Detect shot attempts, classify make/miss, attribute shooters, and export shots.csv / box_score.csv.",
+        lambda: GameProcessor(source, stats_dir, max_frames=max_frames).run(),
+        [
+            stats_dir / "shots.csv",
+            stats_dir / "box_score.csv",
+        ],
+    ))
 
     report_path = out_path / "report.md"
     _write_demo_report(report_path, source, out_path, frame_num, metadata, stages)
@@ -825,7 +837,8 @@ def map_court_video(
     train_stride: int = 30,
     debug: bool = False,
     trajectories_path: str | None = None,
-    max_frames: int | None = None
+    max_frames: int | None = None,
+    smooth: bool = True
 ) -> None:
     """
     Map player positions to court coordinates for full video.
@@ -844,6 +857,8 @@ def map_court_video(
         debug: If True, output additional video with tracking annotations
         trajectories_path: Optional path for exported court-space trajectories JSON
         max_frames: Optional maximum number of frames to process from the start
+        smooth: Temporally smooth the homography and projected court positions
+            (reduces top-down jitter; also gap-fills frames whose keypoints fail)
     """
     import json
     import supervision as sv
@@ -853,10 +868,19 @@ def map_court_video(
     from collections import defaultdict
     from . import detection
     from . import homography
+    from .smoothing import (
+        ema_homography, apply_homography, PositionSmoother,
+        build_dense_xy, dense_to_per_frame_positions, dense_to_trajectories,
+    )
     from sports.common.team import TeamClassifier
     from sports.common.view import ViewTransformer
     from sports.basketball import CourtConfiguration, League, draw_court, draw_points_on_court
     from sports.common.core import MeasurementUnit
+
+    # Temporal smoothing strengths (weight on the current frame; lower = smoother)
+    HOMOGRAPHY_SMOOTH_ALPHA = 0.4
+    POS_SMOOTH_ALPHA = 0.5
+    BALL_SMOOTH_ALPHA = 0.6
 
     print(f"Mapping players to court coordinates for full video: {video_path}")
     out_path = Path(out_dir) / "court_map_video"
@@ -1096,7 +1120,14 @@ def map_court_video(
         
         frame_generator = sv.get_video_frames_generator(source_path=video_path)
         skipped_frames = 0
-        
+
+        # Temporal smoothing state (carried across frames). Player court
+        # positions are cleaned/smoothed after the loop via clean_paths; the
+        # homography is EMA-smoothed inline and the ball gets a light EMA.
+        smoothed_H = None
+        ball_smoother = PositionSmoother(alpha=BALL_SMOOTH_ALPHA) if smooth else None
+        gap_filled_frames = 0
+
         for frame_idx, frame in tqdm(enumerate(frame_generator), total=frames_to_process, desc="Mapping"):
             if frame_idx >= frames_to_process:
                 break
@@ -1141,47 +1172,51 @@ def map_court_video(
             
             # Look up teams for each tracker
             teams = np.array([tracker_team_map.get(tid, 0) for tid in tracker_ids])
-            
+
             # Keypoint detection for homography
             kp_result = homography._keypoint_model.infer(
                 frame,
                 confidence=KEYPOINT_DETECTION_MODEL_CONFIDENCE
             )[0]
             key_points = sv.KeyPoints.from_inference(kp_result)
-            
-            # Check for valid keypoints
-            if key_points.confidence is None or len(key_points.confidence) == 0:
-                video_xy.append((np.array([]), np.array([])))
-                skipped_frames += 1
-                continue
-            
-            landmarks_mask = key_points.confidence[0] > KEYPOINT_DETECTION_MODEL_ANCHOR_CONFIDENCE
-            
-            if np.count_nonzero(landmarks_mask) < 4:
-                video_xy.append((np.array([]), np.array([])))
-                skipped_frames += 1
-                continue
-            
-            # Compute homography
-            court_landmarks = np.array(config.vertices)[landmarks_mask]
-            frame_landmarks = key_points[:, landmarks_mask].xy[0]
-            
-            frame_to_court_transformer = ViewTransformer(
-                source=frame_landmarks,
-                target=court_landmarks
-            )
-            
+
+            # Resolve this frame's homography. When smoothing is on we EMA the
+            # matrix across frames and, on frames whose keypoints fail, fall back
+            # to the last good (smoothed) homography instead of dropping players.
+            frame_H = None
+            if key_points.confidence is not None and len(key_points.confidence) > 0:
+                landmarks_mask = key_points.confidence[0] > KEYPOINT_DETECTION_MODEL_ANCHOR_CONFIDENCE
+                if np.count_nonzero(landmarks_mask) >= 4:
+                    court_landmarks = np.array(config.vertices)[landmarks_mask]
+                    frame_landmarks = key_points[:, landmarks_mask].xy[0]
+                    transformer = ViewTransformer(
+                        source=frame_landmarks, target=court_landmarks)
+                    if smooth:
+                        smoothed_H = ema_homography(
+                            smoothed_H, transformer.m, HOMOGRAPHY_SMOOTH_ALPHA)
+                        frame_H = smoothed_H
+                    else:
+                        frame_H = transformer.m
+
+            if frame_H is None:
+                if smooth and smoothed_H is not None:
+                    frame_H = smoothed_H  # gap-fill with last good homography
+                    gap_filled_frames += 1
+                else:
+                    video_xy.append((np.array([]), np.array([])))
+                    skipped_frames += 1
+                    continue
+
             court_xy = np.array([])
             kept_player_image_centers = np.array([]).reshape(0, 2)
             if len(tracker_ids) > 0:
                 # Transform player positions (bottom center of bbox)
-                # Compute bottom center: (x1+x2)/2, y2
                 bottom_centers = np.column_stack([
                     (xyxys[:, 0] + xyxys[:, 2]) / 2,  # x center
                     xyxys[:, 3]  # y bottom
                 ])
-                court_xy = frame_to_court_transformer.transform_points(points=bottom_centers)
-                
+                court_xy = apply_homography(frame_H, bottom_centers)
+
                 # Apply 5-per-team deduplication
                 court_xy, teams, keep_mask = deduplicate_teams(court_xy, teams, confidences)
                 kept_tracker_ids = tracker_ids[keep_mask] if len(keep_mask) else np.array([])
@@ -1192,6 +1227,8 @@ def map_court_video(
                         (kept_player_xyxys[:, 1] + kept_player_xyxys[:, 3]) / 2,
                     ])
 
+                # Raw court positions are kept here; trajectory cleaning
+                # (clean_paths) runs once over the whole clip after this loop.
                 for tracker_id, xy in zip(kept_tracker_ids, court_xy):
                     player_trajectories[str(int(tracker_id))].append([
                         float(xy[0]),
@@ -1205,18 +1242,14 @@ def map_court_video(
                     (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2,
                     ball_xyxys[:, 3],
                 ])
-                ball_court_xy = frame_to_court_transformer.transform_points(points=ball_centers)
+                ball_court_xy = apply_homography(frame_H, ball_centers)
                 valid_ball_mask = valid_court_mask(ball_court_xy)
+                ball_xy = None
                 if np.any(valid_ball_mask):
                     valid_indices = np.where(valid_ball_mask)[0]
                     best_valid_idx = valid_indices[int(np.argmax(ball_confidences[valid_indices]))]
                     ball_xy = ball_court_xy[best_valid_idx]
                     ball_projected_points += 1
-                    ball_trajectory.append([
-                        float(ball_xy[0]),
-                        float(ball_xy[1]),
-                        int(frame_idx),
-                    ])
                 elif len(court_xy) > 0 and len(kept_player_image_centers) > 0:
                     ball_image_centers = np.column_stack([
                         (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2,
@@ -1229,15 +1262,46 @@ def map_court_video(
                     ball_idx, player_idx = np.unravel_index(np.argmin(distances), distances.shape)
                     ball_xy = court_xy[player_idx]
                     ball_proxy_points += 1
+                if ball_xy is not None:
+                    if smooth and ball_smoother is not None:
+                        ball_xy = ball_smoother.update("ball", ball_xy)
                     ball_trajectory.append([
                         float(ball_xy[0]),
                         float(ball_xy[1]),
                         int(frame_idx),
                     ])
-            
+
             video_xy.append((court_xy, teams))
         
         print(f"\nProcessed {len(video_xy)} frames ({skipped_frames} skipped due to insufficient keypoints/players)")
+        # =====================================================================
+        # Trajectory cleaning: remove teleport outliers, interpolate short
+        # gaps, and Savitzky-Golay smooth each player's court path
+        # (sports.clean_paths). Operates on the whole clip at once.
+        # =====================================================================
+        per_frame_positions = None
+        if smooth and player_trajectories:
+            from sports import clean_paths
+            columns = sorted(player_trajectories.keys(), key=lambda k: int(k))
+            team_by_col = [tracker_team_map.get(int(k), 0) for k in columns]
+            dense, present = build_dense_xy(player_trajectories, columns, frames_to_process)
+            try:
+                cleaned, _edited = clean_paths(
+                    dense,
+                    jump_sigma=3.5, min_jump_dist=0.6, max_jump_run=18,
+                    pad_around_runs=2, smooth_window=9, smooth_poly=2,
+                )
+            except Exception as e:
+                print(f"clean_paths failed ({e}); falling back to raw positions")
+                cleaned = dense
+            per_frame_positions = dense_to_per_frame_positions(cleaned, present, team_by_col)
+            player_trajectories = defaultdict(
+                list, dense_to_trajectories(cleaned, present, columns))
+            print(f"Smoothing ON: homography EMA ({gap_filled_frames} frames "
+                  f"gap-filled) + clean_paths over {len(columns)} tracks")
+        elif smooth:
+            print(f"Smoothing ON: homography EMA; {gap_filled_frames} frames gap-filled "
+                  f"(no player tracks to clean)")
 
         trajectories_file.parent.mkdir(parents=True, exist_ok=True)
         trajectories_payload = {
@@ -1261,6 +1325,9 @@ def map_court_video(
             "metadata": {
                 "coordinate_system": "NBA court feet via Roboflow basketball court vertices",
                 "skipped_frames": int(skipped_frames),
+                "smoothing": bool(smooth),
+                "trajectory_cleaning": "sports.clean_paths" if (smooth and per_frame_positions is not None) else None,
+                "gap_filled_frames": int(gap_filled_frames),
                 "source_total_frames": int(video_info.total_frames),
                 "team_classifier_train_stride": int(train_stride),
                 "max_players_per_team": int(MAX_PLAYERS_PER_TEAM),
@@ -1289,9 +1356,15 @@ def map_court_video(
         )
         
         with sv.VideoSink(str(target), court_video_info) as sink:
-            for court_xy, teams in tqdm(video_xy, desc="Rendering"):
+            for frame_idx in tqdm(range(len(video_xy)), desc="Rendering"):
+                # Prefer cleaned positions when available, else the raw per-frame
+                if per_frame_positions is not None:
+                    court_xy, teams = per_frame_positions.get(
+                        frame_idx, (np.empty((0, 2)), np.array([])))
+                else:
+                    court_xy, teams = video_xy[frame_idx]
                 court_frame = draw_court(config=config)
-                
+
                 if len(court_xy) > 0:
                     # Draw team 0 players
                     team0_mask = teams == 0
@@ -1356,6 +1429,325 @@ def map_court_video(
 
     except Exception as e:
         print(f"\nError during court video mapping: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
+
+
+def map_court_video_sam2(
+    video_path: str,
+    out_dir: str,
+    team1_color: str = "#00FF00",
+    team2_color: str = "#FF0000",
+    train_stride: int = 30,
+    debug: bool = False,
+    trajectories_path: str | None = None,
+    max_frames: int | None = None,
+    smooth: bool = True,
+    sam2_checkpoint: str | None = None,
+    sam2_config: str | None = None,
+    device: str = "cuda",
+) -> None:
+    """
+    SAM2 mask-propagation court mapping (GPU) — the notebook-quality path.
+
+    Prompts the player set on frame 0 with RF-DETR detections, assigns each a
+    team once, then propagates masks across the clip with SAM2 so the same
+    players are tracked every frame with stable ids (no ByteTrack churn). Pairs
+    with clean_paths for outlier removal + smoothing.
+
+    Best for a SHORT hero clip where the same players stay on screen — frame-0
+    prompting does not handle substitutions or hard camera cuts. Requires a SAM2
+    install and a CUDA GPU (run on Colab); see README SAM2 setup.
+    """
+    import json
+    import supervision as sv
+    import subprocess
+    import shutil
+    from tqdm import tqdm
+    from collections import defaultdict
+    from . import detection
+    from . import homography
+    from .smoothing import (
+        ema_homography, apply_homography,
+        build_dense_xy, dense_to_per_frame_positions, dense_to_trajectories,
+    )
+    from .sam2_tracking import load_sam2_predictor, SAM2Tracker
+    from sports.common.team import TeamClassifier
+    from sports.common.view import ViewTransformer
+    from sports.basketball import CourtConfiguration, League, draw_court, draw_points_on_court
+    from sports.common.core import MeasurementUnit
+
+    HOMOGRAPHY_SMOOTH_ALPHA = 0.4
+    COURT_X_MIN, COURT_X_MAX = 0.0, 94.0
+    COURT_Y_MIN, COURT_Y_MAX = 0.0, 50.0
+
+    def valid_court_mask(points):
+        if points is None or len(points) == 0:
+            return np.array([], dtype=bool)
+        return (
+            (points[:, 0] >= COURT_X_MIN) & (points[:, 0] <= COURT_X_MAX) &
+            (points[:, 1] >= COURT_Y_MIN) & (points[:, 1] <= COURT_Y_MAX)
+        )
+
+    print(f"SAM2 court mapping: {video_path}")
+    out_path = Path(out_dir) / "court_map_video"
+    out_path.mkdir(parents=True, exist_ok=True)
+    source = Path(video_path)
+    target = out_path / f"{source.stem}-court-map{source.suffix}"
+    trajectories_file = (Path(trajectories_path) if trajectories_path
+                         else out_path / f"{source.stem}-trajectories.json")
+
+    try:
+        load_model_if_needed()
+        load_keypoint_model()
+        predictor = load_sam2_predictor(sam2_checkpoint, sam2_config)
+
+        config = CourtConfiguration(league=League.NBA, measurement_unit=MeasurementUnit.FEET)
+        video_info = sv.VideoInfo.from_video_path(video_path)
+        frames_to_process = (min(max_frames, video_info.total_frames)
+                             if max_frames is not None else video_info.total_frames)
+
+        # 1. Train the team classifier on sampled frames
+        print(f"Training team classifier (stride={train_stride})...")
+        team_classifier = TeamClassifier(device=device)
+        training_crops = []
+        for sample in sv.get_video_frames_generator(source_path=video_path, stride=train_stride):
+            result = detection._model.infer(
+                sample, confidence=PLAYER_DETECTION_MODEL_CONFIDENCE,
+                iou_threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD,
+                class_agnostic_nms=True)[0]
+            sd = sv.Detections.from_inference(result)
+            sd = sd[np.isin(sd.class_id, list(PLAYER_CLASS_IDS))]
+            for box in sv.scale_boxes(xyxy=sd.xyxy, factor=0.4):
+                crop = sv.crop_image(sample, box)
+                if crop.size > 0:
+                    training_crops.append(crop)
+        if not training_crops:
+            print("Error: no player crops for team classification.")
+            sys.exit(1)
+        team_classifier.fit(training_crops)
+
+        # 2. Frame 0 — detect players, assign teams, prompt SAM2
+        first_frame = next(sv.get_video_frames_generator(source_path=video_path))
+        result = detection._model.infer(
+            first_frame, confidence=PLAYER_DETECTION_MODEL_CONFIDENCE,
+            iou_threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD,
+            class_agnostic_nms=True)[0]
+        dets = sv.Detections.from_inference(result)
+        dets = dets[np.isin(dets.class_id, list(PLAYER_CLASS_IDS))]
+        if len(dets) == 0:
+            print("Error: no players detected in frame 0 to prompt SAM2.")
+            sys.exit(1)
+        dets.tracker_id = np.arange(1, len(dets) + 1)
+        crops = [sv.crop_image(first_frame, b) for b in sv.scale_boxes(dets.xyxy, factor=0.4)]
+        teams0 = np.array(team_classifier.predict(crops))
+        tracker_team_map = {int(tid): int(t) for tid, t in zip(dets.tracker_id, teams0)}
+        print(f"Prompting SAM2 with {len(dets)} players "
+              f"(Team0={int(np.sum(teams0 == 0))}, Team1={int(np.sum(teams0 == 1))})")
+        tracker = SAM2Tracker(predictor)
+        tracker.prompt_first_frame(first_frame, dets)
+
+        # 3. Propagate + homography + project per frame
+        player_trajectories = defaultdict(list)
+        ball_trajectory = []
+        video_xy = []
+        debug_frames = [] if debug else None
+        smoothed_H = None
+        skipped_frames = 0
+        gap_filled_frames = 0
+        ball_detection_frames = ball_projected_points = ball_proxy_points = 0
+
+        if debug:
+            team_colors = sv.ColorPalette.from_hex([team1_color, team2_color])
+            debug_box = sv.BoxAnnotator(color=team_colors, thickness=2,
+                                        color_lookup=sv.ColorLookup.INDEX)
+
+        for frame_idx, frame in tqdm(
+                enumerate(sv.get_video_frames_generator(source_path=video_path)),
+                total=frames_to_process, desc="SAM2 mapping"):
+            if frame_idx >= frames_to_process:
+                break
+
+            player_dets = tracker.propagate(frame)
+            tracker_ids = (player_dets.tracker_id if player_dets.tracker_id is not None
+                           else np.array([]))
+            xyxys = player_dets.xyxy if len(player_dets) else np.array([]).reshape(0, 4)
+
+            # Ball detection (SAM2 only tracks the prompted players)
+            ball_result = detection._model.infer(
+                frame, confidence=PLAYER_DETECTION_MODEL_CONFIDENCE,
+                iou_threshold=PLAYER_DETECTION_MODEL_IOU_THRESHOLD)[0]
+            ball_all = sv.Detections.from_inference(ball_result)
+            ball_all = ball_all[np.isin(ball_all.class_id, list(BALL_CLASS_IDS))]
+            ball_xyxys = ball_all.xyxy.copy() if len(ball_all) else np.array([]).reshape(0, 4)
+            ball_conf = (ball_all.confidence.copy()
+                         if len(ball_all) and ball_all.confidence is not None
+                         else np.ones(len(ball_all)))
+
+            if debug:
+                if len(xyxys) == 0:
+                    debug_frames.append(frame.copy())
+                else:
+                    ddet = sv.Detections(xyxy=xyxys, tracker_id=tracker_ids.astype(int))
+                    fteams = np.array([tracker_team_map.get(int(t), 0) for t in tracker_ids])
+                    annotated = debug_box.annotate(
+                        scene=frame.copy(), detections=ddet, custom_color_lookup=fteams)
+                    debug_frames.append(annotated)
+
+            # Homography (EMA + gap-fill), mirrors the ByteTrack path
+            kp_result = homography._keypoint_model.infer(
+                frame, confidence=KEYPOINT_DETECTION_MODEL_CONFIDENCE)[0]
+            key_points = sv.KeyPoints.from_inference(kp_result)
+            frame_H = None
+            if key_points.confidence is not None and len(key_points.confidence) > 0:
+                landmarks_mask = key_points.confidence[0] > KEYPOINT_DETECTION_MODEL_ANCHOR_CONFIDENCE
+                if np.count_nonzero(landmarks_mask) >= 4:
+                    court_landmarks = np.array(config.vertices)[landmarks_mask]
+                    frame_landmarks = key_points[:, landmarks_mask].xy[0]
+                    transformer = ViewTransformer(source=frame_landmarks, target=court_landmarks)
+                    smoothed_H = (ema_homography(smoothed_H, transformer.m, HOMOGRAPHY_SMOOTH_ALPHA)
+                                  if smooth else transformer.m)
+                    frame_H = smoothed_H
+            if frame_H is None:
+                if smooth and smoothed_H is not None:
+                    frame_H = smoothed_H
+                    gap_filled_frames += 1
+                else:
+                    video_xy.append((np.array([]), np.array([])))
+                    skipped_frames += 1
+                    continue
+
+            court_xy = np.array([])
+            kept_centers = np.array([]).reshape(0, 2)
+            teams = np.array([tracker_team_map.get(int(t), 0) for t in tracker_ids])
+            if len(tracker_ids) > 0:
+                bottom_centers = np.column_stack([
+                    (xyxys[:, 0] + xyxys[:, 2]) / 2, xyxys[:, 3]])
+                court_xy = apply_homography(frame_H, bottom_centers)
+                kept_centers = np.column_stack([
+                    (xyxys[:, 0] + xyxys[:, 2]) / 2, (xyxys[:, 1] + xyxys[:, 3]) / 2])
+                for tid, xy in zip(tracker_ids, court_xy):
+                    player_trajectories[str(int(tid))].append(
+                        [float(xy[0]), float(xy[1]), int(frame_idx)])
+
+            if len(ball_xyxys) > 0:
+                ball_detection_frames += 1
+                ball_centers = np.column_stack([
+                    (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2, ball_xyxys[:, 3]])
+                ball_court = apply_homography(frame_H, ball_centers)
+                valid = valid_court_mask(ball_court)
+                ball_xy = None
+                if np.any(valid):
+                    idxs = np.where(valid)[0]
+                    ball_xy = ball_court[idxs[int(np.argmax(ball_conf[idxs]))]]
+                    ball_projected_points += 1
+                elif len(court_xy) > 0 and len(kept_centers) > 0:
+                    bic = np.column_stack([
+                        (ball_xyxys[:, 0] + ball_xyxys[:, 2]) / 2,
+                        (ball_xyxys[:, 1] + ball_xyxys[:, 3]) / 2])
+                    d = np.linalg.norm(bic[:, None, :] - kept_centers[None, :, :], axis=2)
+                    _, pj = np.unravel_index(np.argmin(d), d.shape)
+                    ball_xy = court_xy[pj]
+                    ball_proxy_points += 1
+                if ball_xy is not None:
+                    ball_trajectory.append([float(ball_xy[0]), float(ball_xy[1]), int(frame_idx)])
+
+            video_xy.append((court_xy, teams))
+
+        print(f"\nProcessed {len(video_xy)} frames ({skipped_frames} skipped)")
+
+        # 4. Clean trajectories (clean_paths), then export + render — shared with
+        #    the ByteTrack path's smoothing helpers.
+        per_frame_positions = None
+        if smooth and player_trajectories:
+            from sports import clean_paths
+            columns = sorted(player_trajectories.keys(), key=lambda k: int(k))
+            team_by_col = [tracker_team_map.get(int(k), 0) for k in columns]
+            dense, present = build_dense_xy(player_trajectories, columns, frames_to_process)
+            try:
+                cleaned, _ = clean_paths(
+                    dense, jump_sigma=3.5, min_jump_dist=0.6, max_jump_run=18,
+                    pad_around_runs=2, smooth_window=9, smooth_poly=2)
+            except Exception as e:
+                print(f"clean_paths failed ({e}); using raw positions")
+                cleaned = dense
+            per_frame_positions = dense_to_per_frame_positions(cleaned, present, team_by_col)
+            player_trajectories = defaultdict(
+                list, dense_to_trajectories(cleaned, present, columns))
+            print(f"Smoothing ON: homography EMA ({gap_filled_frames} gap-filled) "
+                  f"+ clean_paths over {len(columns)} tracks")
+
+        trajectories_file.parent.mkdir(parents=True, exist_ok=True)
+        with trajectories_file.open("w", encoding="utf-8") as f:
+            json.dump({
+                "game_id": source.stem,
+                "source_video": str(source),
+                "fps": float(video_info.fps),
+                "total_frames": int(frames_to_process),
+                "width": int(video_info.width),
+                "height": int(video_info.height),
+                "players": {
+                    str(int(tid)): {"team": int(tracker_team_map.get(int(tid), -1)),
+                                    "trajectory": pts}
+                    for tid, pts in sorted(player_trajectories.items(), key=lambda i: int(i[0]))
+                },
+                "ball": {"trajectory": ball_trajectory},
+                "metadata": {
+                    "coordinate_system": "NBA court feet via Roboflow basketball court vertices",
+                    "tracker": "sam2",
+                    "smoothing": bool(smooth),
+                    "trajectory_cleaning": "sports.clean_paths" if per_frame_positions is not None else None,
+                    "gap_filled_frames": int(gap_filled_frames),
+                    "skipped_frames": int(skipped_frames),
+                    "ball_detection_frames": int(ball_detection_frames),
+                    "ball_projected_points": int(ball_projected_points),
+                    "ball_proxy_points": int(ball_proxy_points),
+                },
+            }, f, indent=2)
+        print(f"Saved trajectories to {trajectories_file}")
+
+        # Render court video
+        court = draw_court(config=config)
+        court_video_info = sv.VideoInfo(width=court.shape[1], height=court.shape[0],
+                                        fps=video_info.fps)
+        with sv.VideoSink(str(target), court_video_info) as sink:
+            for frame_idx in tqdm(range(len(video_xy)), desc="Rendering"):
+                if per_frame_positions is not None:
+                    cxy, cteams = per_frame_positions.get(frame_idx, (np.empty((0, 2)), np.array([])))
+                else:
+                    cxy, cteams = video_xy[frame_idx]
+                court_frame = draw_court(config=config)
+                if len(cxy) > 0:
+                    for team_id, color in [(0, team1_color), (1, team2_color)]:
+                        m = cteams == team_id
+                        if np.any(m):
+                            court_frame = draw_points_on_court(
+                                config=config, xy=cxy[m],
+                                fill_color=sv.Color.from_hex(color), court=court_frame)
+                sink.write_frame(court_frame)
+
+        if debug and debug_frames:
+            debug_target = out_path / f"{source.stem}-tracking-debug{source.suffix}"
+            dv = sv.VideoInfo(width=debug_frames[0].shape[1],
+                              height=debug_frames[0].shape[0], fps=video_info.fps)
+            with sv.VideoSink(str(debug_target), dv) as sink:
+                for df in tqdm(debug_frames, desc="Debug video"):
+                    sink.write_frame(df)
+            print(f"Saved debug video to {debug_target}")
+
+        print(f"\nSaved court map video to {target}")
+        if shutil.which('ffmpeg'):
+            compressed = target.with_stem(target.stem + "_h264")
+            r = subprocess.run(['ffmpeg', '-y', '-loglevel', 'error', '-i', str(target),
+                                '-vcodec', 'libx264', '-crf', '28', str(compressed)],
+                               capture_output=True, text=True)
+            if r.returncode == 0:
+                compressed.replace(target)
+                print(f"Saved re-encoded video to {target}")
+
+    except Exception as e:
+        print(f"\nError during SAM2 court mapping: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
@@ -1949,6 +2341,22 @@ def main() -> None:
         "--video", required=True, help="Path to game video")
     process_parser.add_argument(
         "--out", required=True, help="Output directory")
+    process_parser.add_argument(
+        "--max-frames", type=int,
+        help="Limit processing to the first N frames")
+    process_parser.add_argument(
+        "--start-frame", type=int, default=0,
+        help="First frame to process (default: 0)")
+    process_parser.add_argument(
+        "--end-frame", type=int,
+        help="Stop before this frame (default: end of video)")
+    process_parser.add_argument(
+        "--segments",
+        help="Segments CSV of in-scope frame ranges (skips replays/alt-angles, "
+             "bounds memory). Takes precedence over start/end/max-frames.")
+    process_parser.add_argument(
+        "--no-number-ocr", action="store_true",
+        help="Skip jersey number OCR at shot frames")
 
     # 'test-video' command
     test_parser = subparsers.add_parser(
@@ -2025,6 +2433,16 @@ def main() -> None:
                                         help="Path for exported court-space trajectories JSON")
     map_court_video_parser.add_argument("--max-frames", type=int,
                                         help="Limit processing to the first N frames")
+    map_court_video_parser.add_argument("--no-smooth", action="store_true",
+                                        help="Disable temporal smoothing of homography and court positions")
+    map_court_video_parser.add_argument("--tracker", choices=["bytetrack", "sam2"],
+                                        default="bytetrack",
+                                        help="Player tracker: bytetrack (CPU) or sam2 (GPU, "
+                                             "notebook-quality, best for short clips)")
+    map_court_video_parser.add_argument("--sam2-checkpoint",
+                                        help="SAM2 checkpoint path (or SAM2_CHECKPOINT env)")
+    map_court_video_parser.add_argument("--sam2-config",
+                                        help="SAM2 config yaml path (or SAM2_CONFIG env)")
 
     # 'track-video' command (SAM2 mask tracking)
     track_video_parser = subparsers.add_parser(
@@ -2060,6 +2478,63 @@ def main() -> None:
                             help="Output directory for images")
     num_parser.add_argument("--frames", type=int, default=5,
                             help="Number of frames to sample")
+
+    # 'annotate' command (ground-truth labeling, no models needed)
+    annotate_parser = subparsers.add_parser(
+        "annotate", help="Interactively label shot events as ground truth")
+    annotate_parser.add_argument("--video", required=True,
+                                 help="Path to game video")
+    annotate_parser.add_argument("--out", default="data/labels/ground_truth.csv",
+                                 help="Output CSV path (default: data/labels/ground_truth.csv)")
+
+    # 'report' command (self-contained portfolio HTML walkthrough)
+    report_parser = subparsers.add_parser(
+        "report", help="Build a self-contained portfolio HTML pipeline walkthrough")
+    report_parser.add_argument("--frames-dir", default="data/outputs",
+                               help="Dir containing the stage images (searched recursively)")
+    report_parser.add_argument("--stats-dir",
+                               help="Dir with shots.csv / box_score.csv")
+    report_parser.add_argument("--metrics", action="store_true",
+                               help="Show the accuracy strip (off by default; needs --labels)")
+    report_parser.add_argument("--labels",
+                               help="Ground truth CSV (used only with --metrics)")
+    report_parser.add_argument("--segments",
+                               help="Segments CSV (scopes metrics to processed ranges)")
+    report_parser.add_argument("--fps", type=float, default=30.0,
+                               help="Video FPS for metric matching (default: 30)")
+    report_parser.add_argument("--court-video",
+                               help="Top-down court-map MP4 to feature as the hero clip "
+                                    "(copied next to the HTML)")
+    report_parser.add_argument("--debug-video",
+                               help="Broadcast tracking-overlay MP4 to feature alongside")
+    report_parser.add_argument("--out", default="data/portfolio/pipeline.html",
+                               help="Output HTML path (default: data/portfolio/pipeline.html)")
+
+    # 'mark-segments' command (interactively mark live-play frame ranges)
+    mark_seg_parser = subparsers.add_parser(
+        "mark-segments",
+        help="Interactively mark in-scope live-play frame ranges")
+    mark_seg_parser.add_argument("--video", required=True,
+                                 help="Path to game video")
+    mark_seg_parser.add_argument("--out", default="data/labels/segments.csv",
+                                 help="Output segments CSV (default: data/labels/segments.csv)")
+
+    # 'evaluate' command (predictions vs ground truth)
+    evaluate_parser = subparsers.add_parser(
+        "evaluate", help="Score shots.csv against annotated ground truth")
+    evaluate_parser.add_argument("--shots", required=True,
+                                 help="Path to predicted shots.csv")
+    evaluate_parser.add_argument("--labels", required=True,
+                                 help="Path to ground truth CSV from 'annotate'")
+    evaluate_parser.add_argument("--fps", type=float, default=30.0,
+                                 help="Video FPS, used for the matching window (default: 30)")
+    evaluate_parser.add_argument("--tolerance-s", type=float, default=2.0,
+                                 help="Match tolerance in seconds (default: 2.0)")
+    evaluate_parser.add_argument("--segments",
+                                 help="Segments CSV of in-scope frame ranges; "
+                                      "filters predictions and labels before scoring")
+    evaluate_parser.add_argument("--report-out",
+                                 help="Optional path to write the markdown report")
 
     # ===== PLAY RECOGNITION COMMANDS =====
 
@@ -2129,7 +2604,19 @@ def main() -> None:
         )
 
     elif args.command == "process-game":
-        gp = GameProcessor(Path(args.video), Path(args.out))
+        segments = None
+        if getattr(args, 'segments', None):
+            from .segments import load_segments
+            segments = load_segments(args.segments)
+        gp = GameProcessor(
+            Path(args.video),
+            Path(args.out),
+            max_frames=getattr(args, 'max_frames', None),
+            start_frame=getattr(args, 'start_frame', 0),
+            end_frame=getattr(args, 'end_frame', None),
+            segments=segments,
+            enable_number_ocr=not getattr(args, 'no_number_ocr', False),
+        )
         gp.run()
 
     elif args.command == "test-video":
@@ -2155,16 +2642,24 @@ def main() -> None:
         )
 
     elif args.command == "map-court-video":
-        map_court_video(
-            args.video,
-            args.out,
-            getattr(args, 'team1_color', '#00FF00'),
-            getattr(args, 'team2_color', '#FF0000'),
-            getattr(args, 'train_stride', 30),
-            getattr(args, 'debug', False),
-            getattr(args, 'trajectories_out', None),
-            getattr(args, 'max_frames', None)
+        common = dict(
+            team1_color=getattr(args, 'team1_color', '#00FF00'),
+            team2_color=getattr(args, 'team2_color', '#FF0000'),
+            train_stride=getattr(args, 'train_stride', 30),
+            debug=getattr(args, 'debug', False),
+            trajectories_path=getattr(args, 'trajectories_out', None),
+            max_frames=getattr(args, 'max_frames', None),
+            smooth=not getattr(args, 'no_smooth', False),
         )
+        if getattr(args, 'tracker', 'bytetrack') == "sam2":
+            map_court_video_sam2(
+                args.video, args.out,
+                sam2_checkpoint=getattr(args, 'sam2_checkpoint', None),
+                sam2_config=getattr(args, 'sam2_config', None),
+                **common,
+            )
+        else:
+            map_court_video(args.video, args.out, **common)
 
     elif args.command == "track-video":
         track_video(
@@ -2180,6 +2675,70 @@ def main() -> None:
 
     elif args.command == "test-numbers":
         test_numbers(args.video, args.out, args.frames)
+
+    elif args.command == "annotate":
+        from .annotate import annotate_video
+        annotate_video(args.video, args.out)
+
+    elif args.command == "mark-segments":
+        from .annotate import mark_segments_video
+        mark_segments_video(args.video, args.out)
+
+    elif args.command == "report":
+        import csv as _csv
+        from .report import generate_pipeline_html
+
+        stats_dir = Path(args.stats_dir) if args.stats_dir else None
+        shots, box_score = [], []
+        if stats_dir:
+            shots_path = stats_dir / "shots.csv"
+            box_path = stats_dir / "box_score.csv"
+            if shots_path.exists():
+                with shots_path.open() as f:
+                    shots = list(_csv.DictReader(f))
+            if box_path.exists():
+                with box_path.open() as f:
+                    box_score = list(_csv.DictReader(f))
+
+        show_metrics = getattr(args, 'metrics', False)
+        metrics = None
+        if show_metrics and shots and getattr(args, 'labels', None):
+            from .evaluate import compute_metrics
+            from .segments import load_segments
+            with open(args.labels) as f:
+                labels = list(_csv.DictReader(f))
+            segments = load_segments(args.segments) if getattr(args, 'segments', None) else None
+            metrics = compute_metrics(shots, labels, fps=args.fps, segments=segments)
+
+        videos = []
+        if getattr(args, 'court_video', None):
+            videos.append({
+                "path": args.court_video,
+                "caption": "Top-down court — players tracked and projected to real "
+                           "court coordinates, temporally smoothed.",
+            })
+        if getattr(args, 'debug_video', None):
+            videos.append({
+                "path": args.debug_video,
+                "caption": "Broadcast view — per-frame detection, persistent track "
+                           "IDs, and team colors.",
+            })
+
+        out = generate_pipeline_html(
+            Path(args.out), Path(args.frames_dir), shots, box_score, metrics,
+            show_metrics=show_metrics, videos=videos)
+        print(f"Wrote portfolio report to {out}")
+
+    elif args.command == "evaluate":
+        from .evaluate import evaluate_files
+        evaluate_files(
+            args.shots,
+            args.labels,
+            fps=getattr(args, 'fps', 30.0),
+            tolerance_s=getattr(args, 'tolerance_s', 2.0),
+            segments_csv=getattr(args, 'segments', None),
+            report_out=getattr(args, 'report_out', None),
+        )
 
     elif args.command == "segment-possessions":
         segment_possessions_cmd(

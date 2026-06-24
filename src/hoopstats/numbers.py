@@ -10,8 +10,6 @@ from dataclasses import dataclass
 import re
 import numpy as np
 import supervision as sv
-from inference import get_model
-from sports import ConsecutiveValueTracker
 
 from .config import ROBOFLOW_API_KEY
 
@@ -32,6 +30,9 @@ def load_ocr_model_if_needed():
     """Lazy-load the OCR model (Roboflow hosted VLM via `inference.get_model`)."""
     global _ocr_client
     if _ocr_client is None:
+        # Imported lazily so importing this module stays cheap (tests, exports).
+        from inference import get_model
+
         print(f"Loading OCR model: {NUMBER_OCR_MODEL_ID}...")
         _ocr_client = get_model(
             model_id=NUMBER_OCR_MODEL_ID, api_key=ROBOFLOW_API_KEY)
@@ -117,6 +118,9 @@ class NumberValidator:
         Args:
             n_consecutive: Number of consecutive identical readings required
         """
+        # Imported lazily so importing this module stays cheap (tests, exports).
+        from sports import ConsecutiveValueTracker
+
         self.tracker = ConsecutiveValueTracker(n_consecutive=n_consecutive)
 
     def update(self, track_ids: List[int], numbers: List[str]) -> None:

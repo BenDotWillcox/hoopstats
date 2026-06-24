@@ -58,16 +58,35 @@ class VideoLoader:
         """
         Yields (frame_index, frame_array) for the entire video.
         """
+        yield from self.iter_range(0, None)
+
+    def iter_range(
+        self, start_frame: int = 0, end_frame: Optional[int] = None
+    ) -> Generator[Tuple[int, np.ndarray], None, None]:
+        """
+        Yield (frame_index, frame_array) for frames in [start_frame, end_frame).
+
+        frame_index is the absolute index in the source video, so indices stay
+        aligned with ground-truth labels even when processing a mid-video
+        segment.
+
+        Reads sequentially from the start and discards frames before
+        start_frame rather than using cv2 frame seeking: CAP_PROP_POS_FRAMES
+        seeking is unreliable on many codecs (it lands on the nearest keyframe
+        and can silently return no frames), which would drop whole segments.
+        Sequential decode is slower for a late window but always correct.
+        """
         self._ensure_open()
-        # Always reset to beginning for a fresh iteration
+        start_frame = max(0, start_frame)
         self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        
+
         frame_idx = 0
-        while True:
+        while end_frame is None or frame_idx < end_frame:
             ret, frame = self._cap.read()
             if not ret:
                 break
-            yield frame_idx, frame
+            if frame_idx >= start_frame:
+                yield frame_idx, frame
             frame_idx += 1
 
     def close(self):

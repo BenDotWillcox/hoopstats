@@ -141,3 +141,6 @@ class ShotEvent:
     y_ft: Optional[float]
     distance_ft: Optional[float]
     video_frame_idx: int
+    # Image-space shooter box (xyxy) at the release frame; used for the
+    # homography projection and excluded from CSV export.
+    shooter_xyxy: Optional[tuple] = None

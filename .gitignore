@@ -5,21 +5,29 @@ __pycache__/
 .dist/
 build/
 dist/
+.pytest_cache/
 
 # Virtual env
 .venv/
 env/
 venv/
 
-# Data & models (don’t push raw games to GitHub)
+# Data & models (don’t push raw games or generated artifacts to GitHub)
 data/raw/
 data/processed/
-data/outputs/
+data/outputs*/
 data/demo*/
+data/portfolio/
 data/trajectory-export-check/
 data/ball-export-check/
+data/vertical-slice-check/
+data/segments-check/
+data/smooth-check/
 data/bad/
 models/
+
+# Large reference notebook (has embedded outputs)
+notebooks/roboflow-notebook-improve.ipynb
 
 # IDE/editor
 .vscode/
